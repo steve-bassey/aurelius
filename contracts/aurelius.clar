@@ -99,3 +99,101 @@
 (define-private (validate-recipient (recipient principal))
   (not (is-eq recipient (as-contract tx-sender)))
 )
+
+;; Overflow-safe addition
+(define-private (safe-add
+    (a uint)
+    (b uint)
+  )
+  (let ((sum (+ a b)))
+    (asserts! (>= sum a) err-overflow)
+    (ok sum)
+  )
+)
+
+;; NFT CORE OPERATIONS
+
+;; Mint collateral-backed NFT
+(define-public (mint-nft
+    (uri (string-ascii 256))
+    (collateral uint)
+  )
+  (let (
+      (token-id (+ (var-get total-supply) u1))
+      (collateral-requirement (/ (* (var-get min-collateral-ratio) collateral) u100))
+    )
+    (asserts! (validate-uri uri) err-invalid-uri)
+    (asserts! (>= (stx-get-balance tx-sender) collateral-requirement)
+      err-insufficient-collateral
+    )
+
+    ;; Lock collateral
+    (try! (stx-transfer? collateral-requirement tx-sender (as-contract tx-sender)))
+
+    ;; Register NFT
+    (map-set tokens { token-id: token-id } {
+      owner: tx-sender,
+      uri: uri,
+      collateral: collateral,
+      is-staked: false,
+      stake-timestamp: u0,
+      fractional-shares: u0,
+    })
+
+    (var-set total-supply token-id)
+    (ok token-id)
+  )
+)
+
+;; Transfer entire NFT ownership
+(define-public (transfer-nft
+    (token-id uint)
+    (recipient principal)
+  )
+  (let ((token (unwrap! (get-token-info token-id) err-invalid-token)))
+    (asserts! (validate-recipient recipient) err-invalid-recipient)
+    (asserts! (is-eq tx-sender (get owner token)) err-not-token-owner)
+    (asserts! (not (get is-staked token)) err-already-staked)
+
+    (map-set tokens { token-id: token-id } (merge token { owner: recipient }))
+    (ok true)
+  )
+)
+
+;; MARKETPLACE MODULE
+
+;; Create NFT sale listing
+(define-public (list-nft
+    (token-id uint)
+    (price uint)
+  )
+  (let ((token (unwrap! (get-token-info token-id) err-invalid-token)))
+    (asserts! (> price u0) err-invalid-price)
+    (asserts! (is-eq tx-sender (get owner token)) err-not-token-owner)
+    (asserts! (not (get is-staked token)) err-already-staked)
+
+    (map-set token-listings { token-id: token-id } {
+      price: price,
+      seller: tx-sender,
+      active: true,
+    })
+    (ok true)
+  )
+)
+
+;; Buy NFT with auto fee distribution
+(define-public (purchase-nft (token-id uint))
+  (let (
+      (listing (unwrap! (get-listing token-id) err-listing-not-found))
+      (price (get price listing))
+      (seller (get seller listing))
+      (fee (/ (* price (var-get protocol-fee)) u1000))
+    )
+    (asserts! (get active listing) err-listing-not-found)
+
+    ;; Payment routing
+    (try! (stx-transfer? price tx-sender seller))
+    (try! (stx-transfer? fee tx-sender (as-contract tx-sender)))
+
+    ;; Ownership transfer
+    (try! (transfer-nft token-id tx-sender))
