@@ -197,3 +197,104 @@
 
     ;; Ownership transfer
     (try! (transfer-nft token-id tx-sender))
+
+    ;; Close listing
+    (map-set token-listings { token-id: token-id } {
+      price: u0,
+      seller: seller,
+      active: false,
+    })
+    (ok true)
+  )
+)
+
+;; FRACTIONAL OWNERSHIP MODULE
+
+(define-public (transfer-shares
+    (token-id uint)
+    (recipient principal)
+    (share-amount uint)
+  )
+  (let (
+      (sender-shares (unwrap! (get-fractional-shares token-id tx-sender)
+        err-insufficient-balance
+      ))
+      (recipient-current (default-to { shares: u0 } (get-fractional-shares token-id recipient)))
+      (recipient-new (unwrap! (safe-add (get shares recipient-current) share-amount)
+        err-overflow
+      ))
+    )
+    (asserts! (validate-recipient recipient) err-invalid-recipient)
+    (asserts! (>= (get shares sender-shares) share-amount)
+      err-insufficient-balance
+    )
+
+    ;; Update balances
+    (map-set fractional-ownership {
+      token-id: token-id,
+      owner: tx-sender,
+    } { shares: (- (get shares sender-shares) share-amount) }
+    )
+
+    (map-set fractional-ownership {
+      token-id: token-id,
+      owner: recipient,
+    } { shares: recipient-new }
+    )
+    (ok true)
+  )
+)
+
+;; STAKING & YIELD MODULE
+
+;; Stake NFT
+(define-public (stake-nft (token-id uint))
+  (let ((token (unwrap! (get-token-info token-id) err-invalid-token)))
+    (asserts! (is-eq tx-sender (get owner token)) err-not-token-owner)
+    (asserts! (not (get is-staked token)) err-already-staked)
+
+    (map-set tokens { token-id: token-id }
+      (merge token {
+        is-staked: true,
+        stake-timestamp: stacks-block-height,
+      })
+    )
+
+    (map-set staking-rewards { token-id: token-id } {
+      accumulated-yield: u0,
+      last-claim: stacks-block-height,
+    })
+
+    (var-set total-staked (+ (var-get total-staked) u1))
+    (ok true)
+  )
+)
+
+;; Unstake NFT
+(define-public (unstake-nft (token-id uint))
+  (let (
+      (token (unwrap! (get-token-info token-id) err-invalid-token))
+      (rewards (unwrap! (get-staking-rewards token-id) err-not-staked))
+    )
+    (asserts! (is-eq tx-sender (get owner token)) err-not-token-owner)
+    (asserts! (get is-staked token) err-not-staked)
+
+    (try! (claim-staking-rewards token-id))
+
+    (map-set tokens { token-id: token-id }
+      (merge token {
+        is-staked: false,
+        stake-timestamp: u0,
+      })
+    )
+
+    (var-set total-staked (- (var-get total-staked) u1))
+    (ok true)
+  )
+)
+
+;; READ-ONLY VIEWS
+
+(define-read-only (get-token-info (token-id uint))
+  (map-get? tokens { token-id: token-id })
+)
